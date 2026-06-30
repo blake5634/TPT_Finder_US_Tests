@@ -5,11 +5,16 @@
 #include "soc/gpio_reg.h"
 
 /* ---- Pin configuration ---- */
-#define GPIO_PIN_1   GPIO_NUM_9   /* RMT burst output: 10 pulses @ ~1.818 MHz */
-#define GPIO_PIN_2   GPIO_NUM_10   /* Gate pin: low during burst, high once burst completes */
+#define GPIO_XTAL_DRIVE   GPIO_NUM_9   /* RMT burst output: 10 pulses @ ~1.818 MHz */
+#define GPIO_STATE        GPIO_NUM_10   /* Gate pin: low during burst, high once burst completes */
 
-#define GPIO_OUTPUT_PIN_SEL_PIN2  (1ULL << GPIO_PIN_2)
-#define GPIO_PIN2_BITMASK         (1UL  << GPIO_PIN_2)
+/* GPIO STATES
+ */
+#define STATE_HI_Z  1
+#define STATE_LO_Z  0
+
+#define GPIO_OUTPUT_PIN_SEL_PIN2  (1ULL << GPIO_STATE)
+#define GPIO_STATE_BITMASK         (1UL << GPIO_STATE)
 
 /* ---- Burst / RMT configuration ---- */
 #define PULSE_COUNT_PER_BURST   15      /* number of full square-wave cycles per burst */
