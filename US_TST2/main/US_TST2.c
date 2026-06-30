@@ -57,7 +57,7 @@ void rmt_burst_init(void)
     rmt_tx_channel_config_t tx_chan_config = {
         .clk_src           = RMT_CLK_SRC_DEFAULT,
         .gpio_num           = GPIO_XTAL_DRIVE,
-        .mem_block_symbols  = 64,
+        .mem_block_symbols  = 64,  // standard block size!
         .resolution_hz      = RMT_RESOLUTION_HZ,
         .trans_queue_depth  = 1,
         .flags.invert_out   = false,
@@ -164,14 +164,19 @@ void rmt_burst_task(void *arg)
         gptimer_set_raw_count(s_gate_timer, 0);              /* reset count to 0 */
         gptimer_set_alarm_action(s_gate_timer, &alarm_config); /* re-arm one-shot alarm */
 
+        // Set driver to Lo-Z mode
         REG_WRITE(GPIO_OUT_W1TC_REG, GPIO_STATE_BITMASK);   /* pin low: enter Low-Z window */
-        ESP_ERROR_CHECK(rmt_transmit(s_rmt_chan, s_copy_encoder,
-                                      s_burst_symbols, sizeof(s_burst_symbols),
-                                      &transmit_config));
+
         /* GPIO_STATE will be driven high by gate_timer_alarm_cb() exactly
          * GPTIMER_ALARM_TICKS (5.5us) after gptimer_start() above --
          * independent of RMT's internal completion-callback latency. */
         gptimer_start(s_gate_timer);                         /* start counting now */
+
+        // Start the drive pulses from RMT peripheral
+        ESP_ERROR_CHECK(rmt_transmit(s_rmt_chan, s_copy_encoder,
+                                      s_burst_symbols, sizeof(s_burst_symbols),
+                                      &transmit_config));
+
        // ESP_LOGI(TAG, "Task Loop...");
         vTaskDelay(1);   /* block for exactly 1 OS tick before next burst */
     }
