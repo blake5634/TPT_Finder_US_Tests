@@ -16,19 +16,32 @@ static const char *TAG = "rmt_burst test";
 #define GPTIMER_RESOLUTION_HZ 10000000U   // 1 MHz — adjust to match your define
 #define PRESCALE_VALUE          (APB_CLK_HZ / GPTIMER_RESOLUTION_HZ)  // = 80
 
-static rmt_channel_handle_t s_rmt_chan   = NULL;
+
+//
+//  RMT declares for xtal pulsing
+// static rmt_channel_handle_t s_rmt_chan   = NULL;
 static rmt_encoder_handle_t s_copy_encoder = NULL;
 static rmt_symbol_word_t    s_burst_symbols[PULSE_COUNT_PER_BURST];
 
+//
+//  RMT declares for driver state (HiZ/LoZ) pulsing
+// static rmt_channel_handle_t s_rmt_TriState_chan   = NULL;
+static rmt_symbol_word_t    s_TriState_symbols[PULSE_COUNT_PER_BURST];
+
+// place to store the synchronized channels
+static rmt_channel_handle_t tx_channels[2] = {NULL};  // channel handles
+static rmt_sync_manager_handle_t  s_synchro = NULL;   // needed for resetting
+
+//  Timer for timer-based TriState Control
 static gptimer_handle_t s_gate_timer = NULL;
 
 /* -------------------------------------------------------------------- */
 /* GPIO_STATE setup (plain GPIO, not RMT)                                */
 /* -------------------------------------------------------------------- */
-void gpio_pin2_init(void)
+void gpio_outputs_init(void)
 {
     gpio_config_t io_conf = {
-        .pin_bit_mask = GPIO_OUTPUT_PIN_SEL_PIN2,
+        .pin_bit_mask = GPIO_OUTPUT_PINS_MASK,  // All GPIO outputs (except RMT)
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -45,7 +58,13 @@ void gpio_pin2_init(void)
 /* -------------------------------------------------------------------- */
 void rmt_burst_init(void)
 {
-    /* Pre-build the burst waveform once. Each rmt_symbol_word_t = one
+    // two synchronized channels: https://search.brave.com/ask?q=in+ESP32+IDF%2C+how+to+start+two+RMT+channels+simultaneously&conversation=09443e4317c26a9725c1d8fe894fce6d6d6f
+
+
+    /*
+     *   BURST WAVEFORM rmt_channel
+     *
+     * Pre-build the burst waveform once. Each rmt_symbol_word_t = one
      * full cycle: 1 tick high, 1 tick low. */
     for (int i = 0; i < PULSE_COUNT_PER_BURST; i++) {
         s_burst_symbols[i].level0    = 1;
@@ -55,7 +74,7 @@ void rmt_burst_init(void)
     }
 
     rmt_tx_channel_config_t tx_chan_config = {
-        .clk_src           = RMT_CLK_SRC_DEFAULT,
+        .clk_src            = RMT_CLK_SRC_DEFAULT,
         .gpio_num           = GPIO_XTAL_DRIVE,
         .mem_block_symbols  = 64,  // standard block size!
         .resolution_hz      = RMT_RESOLUTION_HZ,
@@ -63,8 +82,55 @@ void rmt_burst_init(void)
         .flags.invert_out   = false,
         .flags.with_dma     = false,
     };
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &s_rmt_chan));
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &tx_channels[0]));
 
+    /*
+     *   Tristate Channel (solid pulse for duration of wave)
+     */
+
+    /* Pre-build the TriState waveform once. Each rmt_symbol_word_t = one
+     * full cycle: 1 tick Lo-Z, 1 tick Lo-Z. (Low Z for whole pulse train) */
+    for (int i = 0; i < PULSE_COUNT_PER_BURST; i++) {
+        s_TriState_symbols[i].level0    = STATE_LO_Z;
+        s_TriState_symbols[i].duration0 = 1;
+        s_TriState_symbols[i].level1    = STATE_LO_Z;
+        s_TriState_symbols[i].duration1 = 1;
+    }
+
+    rmt_tx_channel_config_t tx_chan_config2 = {
+        .clk_src            = RMT_CLK_SRC_DEFAULT,
+        .gpio_num           = GPIO_TRISTATE_DRIVE,
+        .mem_block_symbols  = 64,  // standard block size!
+        .resolution_hz      = RMT_RESOLUTION_HZ,
+        .trans_queue_depth  = 1,
+        .flags.invert_out   = false,
+        .flags.with_dma     = false,
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config2, &tx_channels[1]));
+
+   /*
+    *   Enable the channels (required before sync_manager and transmit)
+    */
+    for (int i = 0; i < 2; i++) {
+        ESP_ERROR_CHECK(rmt_enable(tx_channels[i]));
+    }
+
+    /*
+     * Sync Manager
+     */
+    rmt_sync_manager_config_t synchro_config = {
+        .tx_channel_array = tx_channels,           // Array of channel handles
+        .array_size = sizeof(tx_channels) / sizeof(tx_channels[0]),
+    };
+
+    ESP_ERROR_CHECK(rmt_new_sync_manager(&synchro_config, &s_synchro));
+    ESP_LOGI(TAG, "Sync manager created for %d channels", 2);
+
+
+
+    /*
+     * Encoder
+     */
     rmt_copy_encoder_config_t copy_encoder_config = {};
     ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_encoder_config, &s_copy_encoder));
 
@@ -73,7 +139,6 @@ void rmt_burst_init(void)
      * not by RMT's transaction-done event, to avoid RMT ISR/ping-pong
      * latency on the gating edge. */
 
-    ESP_ERROR_CHECK(rmt_enable(s_rmt_chan));
 }
 
 /* -------------------------------------------------------------------- */
@@ -144,8 +209,14 @@ void gate_timer_init(void)
 /* -------------------------------------------------------------------- */
 void rmt_burst_task(void *arg)
 {
-    rmt_transmit_config_t transmit_config = {
+    rmt_transmit_config_t transmit_config_01 = {
         .loop_count = 0,   /* single-shot burst */
+        .flags.eot_level=STATE_LO_Z,
+    };
+
+    rmt_transmit_config_t transmit_config_02 = {
+        .loop_count = 0,   /* single-shot burst */
+        .flags.eot_level=STATE_HI_Z,
     };
 
     gptimer_alarm_config_t alarm_config = {
@@ -160,6 +231,10 @@ void rmt_burst_task(void *arg)
          * *before* (or as close as possible to) the RMT burst starting,
          * so the 5.5us window is measured from a consistent reference. */
 
+       // ESP_LOGI(TAG, "Task Loop...");
+        vTaskDelay(1);   /* block for exactly 1 OS tick before next burst */
+
+
         gptimer_stop(s_gate_timer);                         /* ensure clean state */
         gptimer_set_raw_count(s_gate_timer, 0);              /* reset count to 0 */
         gptimer_set_alarm_action(s_gate_timer, &alarm_config); /* re-arm one-shot alarm */
@@ -167,24 +242,42 @@ void rmt_burst_task(void *arg)
         // Set driver to Lo-Z mode
         REG_WRITE(GPIO_OUT_W1TC_REG, GPIO_STATE_BITMASK);   /* pin low: enter Low-Z window */
 
+        // Sync manager starts both after last channel is transmitted.
+        rmt_sync_reset(s_synchro);  // get ready for next time
+
+/*
+
+        // make a timing ref signal
+        gpio_set_level(GPIO_TEST, 1);
+        gpio_set_level(GPIO_TEST, 0);*/
+
         /* GPIO_STATE will be driven high by gate_timer_alarm_cb() exactly
          * GPTIMER_ALARM_TICKS (5.5us) after gptimer_start() above --
          * independent of RMT's internal completion-callback latency. */
-        gptimer_start(s_gate_timer);                         /* start counting now */
+        gptimer_start(s_gate_timer);                         /* start counting now  (~5.5us latency)*/
 
-        // Start the drive pulses from RMT peripheral
+
+        // Start the drive pulses from RMT peripheral     (takes 20us before output starts)
+        rmt_transmit(tx_channels[0], s_copy_encoder,
+                                      s_burst_symbols, sizeof(s_burst_symbols),
+                                      &transmit_config_01);
+
+        // Start the TriStatePulse
+        rmt_transmit(tx_channels[1], s_copy_encoder,
+                                      s_TriState_symbols, sizeof(s_TriState_symbols),
+                                      &transmit_config_02);
+
+/*
         ESP_ERROR_CHECK(rmt_transmit(s_rmt_chan, s_copy_encoder,
                                       s_burst_symbols, sizeof(s_burst_symbols),
-                                      &transmit_config));
+                                      &transmit_config));*/
 
-       // ESP_LOGI(TAG, "Task Loop...");
-        vTaskDelay(1);   /* block for exactly 1 OS tick before next burst */
     }
 }
 
 void app_main(void)
 {
-    gpio_pin2_init();
+    gpio_outputs_init();
     ESP_LOGI(TAG, " GPIO init completed");
 
     rmt_burst_init();
